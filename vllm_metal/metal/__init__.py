@@ -90,6 +90,75 @@ def _build_gdn_source() -> str:
     return "\n".join(parts)
 
 
+def _build_mla_paged_attention_source() -> str:
+    """Concatenate utils + mla into a single source for the MLA library."""
+    parts = [
+        _read_metal_source(_KERNELS_V2_DIR / "utils.metal"),
+        _read_metal_source(_KERNELS_V2_DIR / "mla.metal"),
+    ]
+    return "\n".join(parts)
+
+
+def metal_mla_paged_attention(
+    q_nope,  # [total_q_tokens, num_heads, kv_lora_rank]
+    q_pe,  # [total_q_tokens, num_heads, qk_rope_head_dim]
+    latent_cache,  # [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
+    block_tables,  # [num_seqs, max_blocks_per_seq], int32
+    context_lens,  # [num_seqs], uint32
+    cu_seqlens_q,  # [num_seqs + 1], int32
+    scale: float,
+    heads_per_tg: int = 1,
+):
+    """Paged Multi-head Latent Attention (RFC #360). Returns a lazy
+    ``mx.array`` whose evaluation triggers the kernel dispatch.
+
+    Q is expected to be already projected through ``embed_q`` (so
+    q_nope is in kv_lora_rank space) and ``q_pe`` is RoPE-applied. The
+    caller is responsible for ``unembed_out`` on the result to recover
+    v_head_dim.
+
+    The dispatch is wrapped in an MLX Primitive so it participates in
+    MLX's lazy graph — no ``mx.eval`` / ``mx.synchronize`` boundary
+    inside this entry. ``heads_per_tg`` (G) controls cross-head KV
+    amortization: each threadgroup processes G consecutive query
+    heads sharing the same latent KV; ``num_heads`` must be divisible
+    by G. Currently instantiated for G ∈ {1, 2}.
+    """
+    import mlx.core as mx
+
+    if q_nope.shape[2] != latent_cache.shape[2] - q_pe.shape[2]:
+        raise ValueError(
+            f"MLA shape mismatch: q_nope.shape[2]={q_nope.shape[2]} must equal "
+            f"latent_cache.shape[2] ({latent_cache.shape[2]}) - "
+            f"q_pe.shape[2] ({q_pe.shape[2]})"
+        )
+
+    block_size = latent_cache.shape[1]
+
+    total_q_tokens = int(q_nope.shape[0])
+    num_heads = int(q_nope.shape[1])
+    kv_lora_rank = int(q_nope.shape[2])
+    # ``mx.zeros`` here is lazy — the C++ side replaces ``out``'s
+    # descriptor with the Primitive output before the zeros ever
+    # evaluate, so the memset is never scheduled.
+    out = mx.zeros((total_q_tokens, num_heads, kv_lora_rank), dtype=q_nope.dtype)
+
+    ops = get_ops()
+    ops.mla_paged_attention_primitive(
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables,
+        context_lens,
+        cu_seqlens_q,
+        block_size,
+        scale,
+        heads_per_tg,
+        out,
+    )
+    return out
+
+
 def get_ops() -> ModuleType:
     """JIT-build and import the native paged_ops extension.
 
@@ -129,6 +198,10 @@ def get_ops() -> ModuleType:
     # 5. Initialise GDN linear attention library
     gdn_src = _build_gdn_source()
     mod.init_gdn_library(gdn_src)
+
+    # 6. Initialise MLA paged-attention library (RFC #360)
+    mla_src = _build_mla_paged_attention_source()
+    mod.init_mla_library(mla_src)
 
     _ops_module = mod
     logger.info("Native paged-attention Metal kernels loaded")
